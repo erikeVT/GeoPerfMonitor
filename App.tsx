@@ -1,13 +1,13 @@
-
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import MapView from '@arcgis/core/views/MapView.js';
 import MapComponent from './components/MapComponent';
 import { MetricCharts } from './components/MetricCharts';
-import { PerformanceHistoryChart } from './components/PerformanceHistoryChart';
+import { BenchmarkReport } from './components/BenchmarkReport';
 import { subscribeToMetrics } from './services/monitor';
 import { analyzePerformance } from './services/ai';
-import { MapLayer, NetworkRequestMetric, LayerPerformanceSummary, AIStatus, MapEventHistory } from './types';
+import { MapLayer, NetworkRequestMetric, LayerPerformanceSummary, AIStatus, MapEventHistory, BenchmarkReportData, BenchmarkStepResult } from './types';
 import { DEFAULT_LAYERS } from './constants';
-import { Layers, Activity, Plus, Trash2, AlertCircle, Cpu, Pencil, Check, X, BarChart3, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2 } from 'lucide-react';
+import { Layers, Activity, Plus, Trash2, Cpu, Pencil, Check, X, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2, Table as TableIcon, Download, CheckCircle2, Gauge } from 'lucide-react';
 
 // Simple Markdown Renderer
 const SimpleMarkdown: React.FC<{ content: string }> = ({ content }) => {
@@ -48,17 +48,28 @@ const App: React.FC = () => {
   const [rawMetrics, setRawMetrics] = useState<NetworkRequestMetric[]>([]);
   const [history, setHistory] = useState<MapEventHistory[]>([]);
   const [activeTab, setActiveTab] = useState<'layers' | 'ai'>('layers');
+  const [activeMetricsTab, setActiveMetricsTab] = useState<'current' | 'history' | 'benchmark'>('current');
   
   // Recording State
   const [isRecording, setIsRecording] = useState(false); 
   const isRecordingRef = useRef(false);
   
+  // Map Control
+  const viewRef = useRef<MapView | null>(null);
+
   // Map Event State
   const [isMapUpdating, setIsMapUpdating] = useState(false);
   const prevUpdatingRef = useRef(false);
   
-  // Individual Layer Status (Loading Indicators)
+  // Individual Layer Status
   const [layerStatuses, setLayerStatuses] = useState<Record<string, boolean>>({});
+  const layerStatusesRef = useRef<Record<string, boolean>>({}); // For async access in benchmark
+
+  // Benchmark State
+  const [isRunningBenchmark, setIsRunningBenchmark] = useState(false);
+  const [benchmarkProgress, setBenchmarkProgress] = useState('');
+  const [benchmarkReport, setBenchmarkReport] = useState<BenchmarkReportData | null>(null);
+  const benchmarkMetricsRef = useRef<NetworkRequestMetric[]>([]);
 
   // Layer Adding/Editing State
   const [newLayerUrl, setNewLayerUrl] = useState('');
@@ -72,7 +83,7 @@ const App: React.FC = () => {
   const [aiStatus, setAiStatus] = useState<AIStatus>(AIStatus.IDLE);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
 
-  // Assign colors to layers dynamically (Only for those in metrics)
+  // Assign colors
   const layersWithColors = useMemo(() => {
       return layers.map((l, i) => ({
           ...l,
@@ -86,32 +97,29 @@ const App: React.FC = () => {
       return map;
   }, [layersWithColors]);
 
+  const metricLayers = useMemo(() => {
+      return layersWithColors.filter(l => !l.excludeFromMetrics);
+  }, [layersWithColors]);
+
   useEffect(() => {
     const unsubscribe = subscribeToMetrics((metric) => {
+      // Standard recording
       if (isRecordingRef.current) {
         setRawMetrics(prev => [...prev.slice(-3000), metric]); 
       }
+      // Separate Benchmark recording
+      if (isRunningBenchmark) {
+          benchmarkMetricsRef.current.push(metric);
+      }
     });
     return unsubscribe;
-  }, []);
+  }, [isRunningBenchmark]);
 
-  const handlePlay = () => {
-      setIsRecording(true);
-      isRecordingRef.current = true;
-  };
+  const handlePlay = () => { setIsRecording(true); isRecordingRef.current = true; };
+  const handlePause = () => { setIsRecording(false); isRecordingRef.current = false; };
+  const handleReset = () => { setRawMetrics([]); setHistory([]); setCompareIds([]); };
 
-  const handlePause = () => {
-      setIsRecording(false);
-      isRecordingRef.current = false;
-  };
-
-  const handleReset = () => {
-      setRawMetrics([]);
-      setHistory([]);
-      setCompareIds([]);
-  };
-
-  // Auto-detect type logic
+  // Auto-detect layer type
   useEffect(() => {
     if (!newLayerUrl) return;
     const lowerUrl = newLayerUrl.toLowerCase();
@@ -136,32 +144,18 @@ const App: React.FC = () => {
     return () => clearTimeout(timer);
   }, [newLayerUrl]);
 
-  // Aggregate metrics: Calculate Load Time (Wall Clock)
-  // Filter out excluded layers
-  const aggregatedMetrics = useMemo(() => {
+  // Aggregation Logic (Reusable)
+  const calculateMetrics = (metrics: NetworkRequestMetric[]) => {
     const stats: Record<string, LayerPerformanceSummary> = {};
-    
-    // Only initialize stats for layers NOT excluded from metrics
-    const metricLayers = layersWithColors.filter(l => !l.excludeFromMetrics);
-
     metricLayers.forEach(l => {
         stats[l.id] = {
-            id: l.id,
-            title: l.title,
-            domain: new URL(l.url).hostname,
-            requestCount: 0,
-            avgLatency: 0,
-            totalDuration: 0, 
-            loadTime: 0,      
-            totalSize: 0,
-            errorCount: 0,
-            requests: []
+            id: l.id, title: l.title, domain: new URL(l.url).hostname,
+            requestCount: 0, avgLatency: 0, totalDuration: 0, loadTime: 0,
+            totalSize: 0, errorCount: 0, requests: []
         };
     });
 
-    // Bin requests to layers
-    rawMetrics.forEach(m => {
-        // Only match against metric-enabled layers
+    metrics.forEach(m => {
         const matchedLayer = metricLayers.find(l => m.url.toLowerCase().includes(l.url.toLowerCase()));
         if (matchedLayer) {
             const s = stats[matchedLayer.id];
@@ -173,46 +167,163 @@ const App: React.FC = () => {
         }
     });
 
-    // Calculate Wall Clock Time (Min Start -> Max End)
     Object.values(stats).forEach(s => {
         if (s.requests.length > 0) {
-            const startTimes = s.requests.map(r => r.startTime);
-            const endTimes = s.requests.map(r => r.endTime);
-            const minStart = Math.min(...startTimes);
-            const maxEnd = Math.max(...endTimes);
+            const minStart = Math.min(...s.requests.map(r => r.startTime));
+            const maxEnd = Math.max(...s.requests.map(r => r.endTime));
             s.loadTime = maxEnd - minStart;
         }
     });
+    return Object.values(stats);
+  };
 
-    return Object.values(stats).sort((a, b) => b.loadTime - a.loadTime);
-  }, [rawMetrics, layersWithColors]);
+  const aggregatedMetrics = useMemo(() => calculateMetrics(rawMetrics), [rawMetrics, metricLayers]);
 
-  // Logic to Snapshot Metrics when Map Event Ends
+  // Map Event Handling
   useEffect(() => {
     if (!isRecording) return;
-
-    // Start of an event
+    // Start Event
     if (isMapUpdating && !prevUpdatingRef.current) {
-        setRawMetrics([]);
+        if (!isRunningBenchmark) setRawMetrics([]); // Auto-clear only if regular usage
     }
-
-    // End of an event: Snapshot using loadTime
+    // End Event
     if (!isMapUpdating && prevUpdatingRef.current) {
-        if (aggregatedMetrics.some(m => m.requestCount > 0)) {
+        // Only record history if regular usage
+        if (!isRunningBenchmark && aggregatedMetrics.some(m => m.requestCount > 0)) {
              const snapshot: MapEventHistory = {
                  id: history.length + 1,
                  timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
                  layerDurations: {}
              };
-             aggregatedMetrics.forEach(m => {
-                 snapshot.layerDurations[m.id] = m.loadTime / 1000; // Store in Seconds
-             });
-             setHistory(prev => [...prev.slice(-19), snapshot]);
+             aggregatedMetrics.forEach(m => snapshot.layerDurations[m.id] = m.loadTime / 1000);
+             setHistory(prev => [...prev, snapshot]);
         }
     }
-
     prevUpdatingRef.current = isMapUpdating;
-  }, [isMapUpdating, isRecording, aggregatedMetrics, history.length]);
+  }, [isMapUpdating, isRecording, aggregatedMetrics, history.length, isRunningBenchmark]);
+
+  // --- BENCHMARK LOGIC ---
+  const waitForIdle = async (timeout = 15000) => {
+      const start = Date.now();
+      
+      // Wait until view updating is false AND all layers are done
+      while (Date.now() - start < timeout) {
+         await new Promise(r => setTimeout(r, 200));
+         
+         if (viewRef.current?.updating) continue;
+         const layersBusy = Object.values(layerStatusesRef.current).some(status => status === true);
+         if (layersBusy) continue;
+
+         // Settlement period to catch stragglers
+         await new Promise(r => setTimeout(r, 800));
+         if (!viewRef.current?.updating && !Object.values(layerStatusesRef.current).some(s => s)) {
+             return true;
+         }
+      }
+      return false; 
+  };
+
+  const runBenchmark = async () => {
+      if (!viewRef.current) return;
+      setIsRunningBenchmark(true);
+      setBenchmarkReport(null);
+      
+      // Temporarily disable regular recording to keep UI clean
+      const originalRecording = isRecordingRef.current;
+      setIsRecording(false); 
+      isRecordingRef.current = false; // Use explicit benchmark ref instead
+
+      const startCenter = [-72.5778, 44.5588]; // VT Center
+
+      const steps = [
+          { name: '1. Initialize (Z9)', action: () => viewRef.current?.goTo({ zoom: 9, center: startCenter }) },
+          { name: '2. Zoom In (Z10)', action: () => viewRef.current?.goTo({ zoom: 10 }) },
+          { name: '3. Pan East', action: () => viewRef.current?.goTo({ center: [-72.40, 44.5588] }) },
+          { name: '4. Zoom In (Z11)', action: () => viewRef.current?.goTo({ zoom: 11 }) },
+          { name: '5. Pan South', action: () => viewRef.current?.goTo({ center: [-72.40, 44.45] }) },
+          { name: '6. Zoom In (Z12)', action: () => viewRef.current?.goTo({ zoom: 12 }) },
+          { name: '7. Pan West', action: () => viewRef.current?.goTo({ center: [-72.58, 44.45] }) },
+          { name: '8. Zoom In (Z13)', action: () => viewRef.current?.goTo({ zoom: 13 }) },
+          { name: '9. Pan North', action: () => viewRef.current?.goTo({ center: [-72.58, 44.56] }) },
+          { name: '10. Reset (Z9)', action: () => viewRef.current?.goTo({ zoom: 9, center: startCenter }) },
+      ];
+
+      const results: BenchmarkStepResult[] = [];
+
+      try {
+          setBenchmarkProgress("Preparing...");
+          await waitForIdle();
+
+          for (const step of steps) {
+              setBenchmarkProgress(`Executing: ${step.name}`);
+              
+              // Clear accumulator
+              benchmarkMetricsRef.current = [];
+              
+              // Run
+              await step.action();
+              await waitForIdle();
+              
+              // Process Results
+              const stepMetrics = calculateMetrics(benchmarkMetricsRef.current);
+              const resultLayerMetrics: Record<string, { loadTime: number; requestCount: number }> = {};
+              metricLayers.forEach(l => {
+                  const sm = stepMetrics.find(s => s.id === l.id);
+                  resultLayerMetrics[l.id] = {
+                      loadTime: sm ? sm.loadTime / 1000 : 0,
+                      requestCount: sm ? sm.requestCount : 0
+                  };
+              });
+
+              results.push({
+                  stepName: step.name,
+                  layerMetrics: resultLayerMetrics
+              });
+              
+              await new Promise(r => setTimeout(r, 500)); 
+          }
+
+          // Generate Report
+          const summary: BenchmarkReportData['summary'] = {};
+          metricLayers.forEach(l => {
+              const layerSteps = results.map(r => r.layerMetrics[l.id]);
+              const totalLoad = layerSteps.reduce((acc, curr) => acc + curr.loadTime, 0);
+              const totalReq = layerSteps.reduce((acc, curr) => acc + curr.requestCount, 0);
+              summary[l.id] = {
+                  avgLoadTime: totalLoad / results.length,
+                  totalRequests: totalReq,
+                  score: totalLoad 
+              };
+          });
+
+          let fastestId = metricLayers[0]?.id;
+          let slowestId = metricLayers[0]?.id;
+          metricLayers.forEach(l => {
+              if (summary[l.id].score < summary[fastestId].score) fastestId = l.id;
+              if (summary[l.id].score > summary[slowestId].score) slowestId = l.id;
+          });
+
+          setBenchmarkReport({
+              date: new Date().toLocaleString(),
+              steps: results,
+              summary,
+              fastestLayerId: fastestId,
+              slowestLayerId: slowestId
+          });
+
+      } catch (e) {
+          console.error("Benchmark Failed", e);
+      } finally {
+          setIsRunningBenchmark(false);
+          setBenchmarkProgress("");
+          if (originalRecording) {
+              setIsRecording(true);
+              isRecordingRef.current = true;
+          }
+      }
+  };
+
+  // --- End Benchmark Logic ---
 
   const handleAddLayer = () => {
     if (!newLayerUrl) return;
@@ -220,39 +331,17 @@ const App: React.FC = () => {
     const title = newLayerName || `Layer ${layers.length + 1} (${newLayerType})`;
     const newLayer: MapLayer = { id, title, url: newLayerUrl, type: newLayerType, visible: true };
     setLayers([...layers, newLayer]);
-    setNewLayerUrl('');
-    setNewLayerName('');
+    setNewLayerUrl(''); setNewLayerName('');
   };
-
-  const handleToggleLayer = (id: string) => {
-    setLayers(layers.map(l => l.id === id ? { ...l, visible: !l.visible } : l));
-  };
-
-  const handleRemoveLayer = (id: string) => {
-    setLayers(layers.filter(l => l.id !== id));
-    setCompareIds(prev => prev.filter(cid => cid !== id));
-  };
-
-  const startEditing = (layer: MapLayer) => {
-      setEditingId(layer.id);
-      setEditTitle(layer.title);
-  };
-
-  const saveEditing = (id: string) => {
-      setLayers(layers.map(l => l.id === id ? { ...l, title: editTitle } : l));
-      setEditingId(null);
-  };
-
-  const handleCompareToggle = (id: string) => {
-      setCompareIds(prev => {
-          if (prev.includes(id)) return prev.filter(p => p !== id);
-          if (prev.length >= 2) return [prev[1], id];
-          return [...prev, id];
-      });
-  };
+  const handleToggleLayer = (id: string) => setLayers(layers.map(l => l.id === id ? { ...l, visible: !l.visible } : l));
+  const handleRemoveLayer = (id: string) => { setLayers(layers.filter(l => l.id !== id)); setCompareIds(prev => prev.filter(cid => cid !== id)); };
+  const startEditing = (layer: MapLayer) => { setEditingId(layer.id); setEditTitle(layer.title); };
+  const saveEditing = (id: string) => { setLayers(layers.map(l => l.id === id ? { ...l, title: editTitle } : l)); setEditingId(null); };
+  const handleCompareToggle = (id: string) => setCompareIds(prev => { if (prev.includes(id)) return prev.filter(p => p !== id); if (prev.length >= 2) return [prev[1], id]; return [...prev, id]; });
   
   const handleLayerStatusChange = (layerId: string, isUpdating: boolean) => {
       setLayerStatuses(prev => ({ ...prev, [layerId]: isUpdating }));
+      layerStatusesRef.current[layerId] = isUpdating; // Sync ref for benchmark
   };
 
   const runAIAnalysis = async () => {
@@ -261,10 +350,25 @@ const App: React.FC = () => {
       const result = await analyzePerformance(aggregatedMetrics);
       setAiAnalysis(result);
       setAiStatus(AIStatus.COMPLETE);
-    } catch (e) {
-      console.error(e);
-      setAiStatus(AIStatus.ERROR);
-    }
+    } catch (e) { console.error(e); setAiStatus(AIStatus.ERROR); }
+  };
+
+  const downloadCSV = () => {
+      if (history.length === 0) return;
+      const headers = ['Event ID', 'Timestamp', ...metricLayers.map(l => `"${l.title}" (s)`)];
+      const rows = history.map(h => {
+          const values = metricLayers.map(l => (h.layerDurations[l.id] || 0).toFixed(3));
+          return [h.id, h.timestamp, ...values];
+      });
+      const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `geoperf_metrics_${new Date().toISOString().slice(0,10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
   };
 
   const comparisonData = useMemo(() => {
@@ -272,22 +376,26 @@ const App: React.FC = () => {
       const l1 = aggregatedMetrics.find(m => m.id === compareIds[0]);
       const l2 = aggregatedMetrics.find(m => m.id === compareIds[1]);
       if (!l1 || !l2) return null;
-      
       const fast = l1.loadTime <= l2.loadTime ? l1 : l2;
       const slow = l1.loadTime <= l2.loadTime ? l2 : l1;
-      
       const diff = slow.loadTime - fast.loadTime;
       const percentDiff = fast.loadTime > 0 ? ((diff / fast.loadTime) * 100) : 0;
-      
       return { l1, l2, fast, slow, diff, percentDiff };
   }, [compareIds, aggregatedMetrics]);
 
   return (
     <div className="flex flex-col h-screen w-full bg-zinc-950 text-zinc-100 overflow-hidden font-sans">
       <header className="h-14 border-b border-zinc-800 flex items-center px-4 bg-zinc-900/50 backdrop-blur-md z-10 justify-between">
-        <div className="flex items-center gap-2">
-            <Activity className="w-5 h-5 text-blue-500" />
-            <h1 className="font-bold text-lg tracking-tight">GeoPerf <span className="text-zinc-500 font-normal">Monitor</span></h1>
+        <div className="flex items-center gap-3">
+            <img 
+              src="https://anrmaps.vermont.gov/websites/Images/Logos/MOMlogo.png" 
+              alt="Vermont State Logo" 
+              className="w-8 h-8 object-contain"
+            />
+            <div>
+                <h1 className="font-bold text-sm leading-tight text-zinc-100">VCGI Map Performance Monitor</h1>
+                <div className="text-[10px] text-zinc-500 font-medium tracking-wide">STATE OF VERMONT</div>
+            </div>
         </div>
         <div className="flex items-center gap-4 text-xs">
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800">
@@ -330,17 +438,14 @@ const App: React.FC = () => {
                                                 )}
                                             </div>
                                             <div className="flex items-center gap-1 ml-2">
-                                                {/* Status Indicator */}
                                                 {layerStatuses[layer.id] ? (
                                                     <Loader2 className="w-3 h-3 text-blue-400 animate-spin" />
                                                 ) : (
                                                     <div className="w-3 h-3 flex items-center justify-center">
-                                                        {/* Only show checkmark if visible and recently loaded? Or just empty if idle? */}
                                                         {layer.visible && <div className="w-1.5 h-1.5 rounded-full bg-zinc-700"></div>}
                                                     </div>
                                                 )}
 
-                                                {/* Actions */}
                                                 {editingId === layer.id ? (
                                                     <>
                                                         <button onClick={() => saveEditing(layer.id)} className="text-green-400 p-1"><Check className="w-3 h-3" /></button>
@@ -397,84 +502,210 @@ const App: React.FC = () => {
         </div>
 
         {/* RIGHT Sidebar: Metrics */}
-        <div className="absolute right-4 top-4 bottom-4 w-80 z-20 flex flex-col pointer-events-none">
+        <div className="absolute right-4 top-4 bottom-4 w-96 z-20 flex flex-col pointer-events-none">
              <div className="bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-xl shadow-2xl flex flex-col overflow-hidden pointer-events-auto h-full">
+                
+                {/* Metrics Header */}
                 <div className="p-3 border-b border-zinc-800 bg-zinc-900/50 flex items-center justify-between">
-                   <h2 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-                      <BarChart3 className="w-4 h-4 text-blue-500" />
-                      Metrics {isRecording && isMapUpdating && <span className="flex h-2 w-2 rounded-full bg-blue-500 animate-ping ml-1"></span>}
-                   </h2>
+                   <div className="flex items-center gap-3">
+                       <div className="flex bg-zinc-950 rounded-lg p-0.5 border border-zinc-800">
+                            <button onClick={() => setActiveMetricsTab('current')} className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${activeMetricsTab === 'current' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}>Current</button>
+                            <button onClick={() => setActiveMetricsTab('history')} className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${activeMetricsTab === 'history' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}>History</button>
+                            <button onClick={() => setActiveMetricsTab('benchmark')} className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${activeMetricsTab === 'benchmark' ? 'bg-zinc-800 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}>Benchmark</button>
+                       </div>
+                       {(isRecording && isMapUpdating) || isRunningBenchmark ? <span className="flex h-2 w-2 rounded-full bg-blue-500 animate-ping"></span> : null}
+                   </div>
                    <div className="flex items-center gap-1">
                       {!isRecording ? (
-                          <button onClick={handlePlay} className="p-1.5 bg-zinc-800 hover:bg-green-600/20 hover:text-green-400 text-zinc-400 rounded transition-colors"><Play className="w-4 h-4 fill-current" /></button>
+                          <button onClick={handlePlay} disabled={isRunningBenchmark} className="p-1.5 bg-zinc-800 hover:bg-green-600/20 hover:text-green-400 text-zinc-400 rounded transition-colors disabled:opacity-50"><Play className="w-4 h-4 fill-current" /></button>
                       ) : (
-                          <button onClick={handlePause} className="p-1.5 bg-zinc-800 hover:bg-amber-600/20 hover:text-amber-400 text-zinc-400 rounded transition-colors"><Pause className="w-4 h-4 fill-current" /></button>
+                          <button onClick={handlePause} disabled={isRunningBenchmark} className="p-1.5 bg-zinc-800 hover:bg-amber-600/20 hover:text-amber-400 text-zinc-400 rounded transition-colors disabled:opacity-50"><Pause className="w-4 h-4 fill-current" /></button>
                       )}
-                      <button onClick={handleReset} className="p-1.5 bg-zinc-800 hover:bg-red-600/20 hover:text-red-400 text-zinc-400 rounded transition-colors"><RotateCcw className="w-4 h-4" /></button>
+                      <button onClick={handleReset} disabled={isRunningBenchmark} className="p-1.5 bg-zinc-800 hover:bg-red-600/20 hover:text-red-400 text-zinc-400 rounded transition-colors disabled:opacity-50"><RotateCcw className="w-4 h-4" /></button>
                    </div>
                 </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-6">
-                    
-                    {comparisonData && (
-                        <div className="bg-zinc-800/50 border border-zinc-700 rounded-lg p-3 space-y-3">
-                            <div className="flex items-center gap-2 text-xs font-semibold text-zinc-400 uppercase tracking-wider"><ArrowRightLeft className="w-3 h-3" /> Comparison</div>
-                            
-                            <div className="grid grid-cols-2 gap-2">
-                                <div className={`p-2 rounded bg-zinc-900 border ${comparisonData.fast.id === comparisonData.l1.id ? 'border-green-500/30' : 'border-red-500/30'}`}>
-                                     <div className="text-[10px] text-zinc-500 truncate mb-1" title={comparisonData.l1.title}>{comparisonData.l1.title}</div>
-                                     <div className="font-mono font-bold text-sm">{(comparisonData.l1.loadTime/1000).toFixed(2)}s</div>
-                                </div>
-                                <div className={`p-2 rounded bg-zinc-900 border ${comparisonData.fast.id === comparisonData.l2.id ? 'border-green-500/30' : 'border-red-500/30'}`}>
-                                     <div className="text-[10px] text-zinc-500 truncate mb-1" title={comparisonData.l2.title}>{comparisonData.l2.title}</div>
-                                     <div className="font-mono font-bold text-sm">{(comparisonData.l2.loadTime/1000).toFixed(2)}s</div>
-                                </div>
-                            </div>
 
-                            <div className="bg-zinc-900/80 rounded p-2 border border-zinc-800 flex flex-col items-center text-center">
-                                <div className="flex items-center gap-1 text-xs text-zinc-400 mb-1">
-                                    <Trophy className="w-3 h-3 text-yellow-500" />
-                                    <span className="font-semibold text-zinc-200">{comparisonData.fast.title}</span> is faster
+                <div className="flex-1 overflow-hidden relative flex flex-col">
+                    
+                    {/* CURRENT TAB */}
+                    {activeMetricsTab === 'current' && (
+                        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+                            {comparisonData && (
+                                <div className="bg-zinc-800/50 border border-zinc-700 rounded-lg p-3 space-y-3">
+                                    <div className="flex items-center gap-2 text-xs font-semibold text-zinc-400 uppercase tracking-wider"><ArrowRightLeft className="w-3 h-3" /> Comparison</div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div className={`p-2 rounded bg-zinc-900 border ${comparisonData.fast.id === comparisonData.l1.id ? 'border-green-500/30' : 'border-red-500/30'}`}>
+                                            <div className="text-[10px] text-zinc-500 truncate mb-1">{comparisonData.l1.title}</div>
+                                            <div className="font-mono font-bold text-sm">{(comparisonData.l1.loadTime/1000).toFixed(2)}s</div>
+                                        </div>
+                                        <div className={`p-2 rounded bg-zinc-900 border ${comparisonData.fast.id === comparisonData.l2.id ? 'border-green-500/30' : 'border-red-500/30'}`}>
+                                            <div className="text-[10px] text-zinc-500 truncate mb-1">{comparisonData.l2.title}</div>
+                                            <div className="font-mono font-bold text-sm">{(comparisonData.l2.loadTime/1000).toFixed(2)}s</div>
+                                        </div>
+                                    </div>
+                                    <div className="bg-zinc-900/80 rounded p-2 border border-zinc-800 flex flex-col items-center text-center">
+                                        <div className="flex items-center gap-1 text-xs text-zinc-400 mb-1">
+                                            <Trophy className="w-3 h-3 text-yellow-500" />
+                                            <span className="font-semibold text-zinc-200">{comparisonData.fast.title}</span> is faster
+                                        </div>
+                                        <div className="text-xs text-zinc-500">
+                                            <span className="text-green-400 font-bold">{comparisonData.percentDiff.toFixed(1)}%</span> faster
+                                        </div>
+                                    </div>
                                 </div>
-                                <div className="text-xs text-zinc-500">
-                                    <span className="text-green-400 font-bold">{comparisonData.percentDiff.toFixed(1)}%</span> faster than {comparisonData.slow.title}
+                            )}
+
+                            <div className="space-y-2">
+                                <div className="flex justify-between items-center">
+                                    <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex items-center gap-1"><Timer className="w-3 h-3" /> Load Times</h3>
+                                    {compareIds.length > 0 && <button onClick={() => setCompareIds([])} className="text-[10px] text-blue-400 hover:underline">Clear Selection</button>}
                                 </div>
-                                <div className="text-[10px] text-zinc-600 mt-1">
-                                    Difference: {(comparisonData.diff / 1000).toFixed(3)}s
-                                </div>
+                                
+                                {rawMetrics.length === 0 && !isRecording && !isRunningBenchmark && (
+                                    <div className="p-4 border border-dashed border-zinc-800 rounded-lg text-center">
+                                        <p className="text-zinc-500 text-xs mb-2">Monitoring is paused.</p>
+                                        <button onClick={handlePlay} className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded">Start</button>
+                                    </div>
+                                )}
+
+                                <MetricCharts 
+                                    data={aggregatedMetrics} 
+                                    selectedIds={compareIds}
+                                    onToggleSelection={handleCompareToggle}
+                                    layerColors={layerColorMap}
+                                />
                             </div>
                         </div>
                     )}
 
-                    <div className="space-y-2">
-                        <div className="flex justify-between items-center">
-                            <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex items-center gap-1"><Timer className="w-3 h-3" /> Load Times</h3>
-                            {compareIds.length > 0 && <button onClick={() => setCompareIds([])} className="text-[10px] text-blue-400 hover:underline">Clear Selection</button>}
-                        </div>
-                        
-                        {rawMetrics.length === 0 && !isRecording && (
-                            <div className="p-4 border border-dashed border-zinc-800 rounded-lg text-center">
-                                <p className="text-zinc-500 text-xs mb-2">Monitoring is paused.</p>
-                                <button onClick={handlePlay} className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded">Start</button>
+                    {/* HISTORY TAB */}
+                    {activeMetricsTab === 'history' && (
+                        <div className="flex flex-col h-full">
+                            {history.length > 0 && (
+                                <div className="p-2 border-b border-zinc-800 flex justify-end">
+                                    <button onClick={downloadCSV} className="flex items-center gap-1 text-xs text-zinc-400 hover:text-white transition-colors">
+                                        <Download className="w-3 h-3" /> Export CSV
+                                    </button>
+                                </div>
+                            )}
+                            <div className="flex-1 overflow-auto">
+                                {history.length === 0 ? (
+                                    <div className="h-full flex flex-col items-center justify-center text-zinc-600 p-4 text-center space-y-2">
+                                        <TableIcon className="w-8 h-8 opacity-50" />
+                                        <p className="text-xs">No history recorded yet.</p>
+                                    </div>
+                                ) : (
+                                    <table className="w-full text-left border-collapse">
+                                        <thead className="bg-zinc-950 sticky top-0 z-10 shadow-sm">
+                                            <tr>
+                                                <th className="text-[10px] uppercase font-bold text-zinc-500 p-2 border-b border-zinc-800 w-8">#</th>
+                                                <th className="text-[10px] uppercase font-bold text-zinc-500 p-2 border-b border-zinc-800 w-16">Time</th>
+                                                {metricLayers.map(l => (
+                                                    <th key={l.id} className="text-[10px] uppercase font-bold text-zinc-500 p-2 border-b border-zinc-800 truncate max-w-[80px]" title={l.title}>{l.title}</th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-zinc-800/50">
+                                            {[...history].reverse().map((h) => (
+                                                <tr key={h.id} className="hover:bg-zinc-900/50 transition-colors group">
+                                                    <td className="p-2 text-xs font-mono text-zinc-600">{h.id}</td>
+                                                    <td className="p-2 text-xs text-zinc-400 whitespace-nowrap">{h.timestamp}</td>
+                                                    {metricLayers.map(l => {
+                                                        const duration = h.layerDurations[l.id];
+                                                        return <td key={l.id} className="p-2 text-xs font-mono text-zinc-300">{duration ? duration.toFixed(3) : '-'}</td>
+                                                    })}
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
                             </div>
-                        )}
-
-                        <MetricCharts 
-                            data={aggregatedMetrics} 
-                            selectedIds={compareIds}
-                            onToggleSelection={handleCompareToggle}
-                            layerColors={layerColorMap}
-                        />
-                    </div>
-                    
-                    {history.length > 0 && (
-                        <PerformanceHistoryChart history={history} layers={layersWithColors.filter(l => !l.excludeFromMetrics)} />
+                        </div>
                     )}
+
+                    {/* BENCHMARK TAB */}
+                    {activeMetricsTab === 'benchmark' && (
+                        <div className="flex flex-col h-full">
+                            {benchmarkReport ? (
+                                <BenchmarkReport report={benchmarkReport} layers={layers} onClose={() => setBenchmarkReport(null)} />
+                            ) : (
+                                <div className="flex flex-col h-full items-center justify-center p-6 space-y-6">
+                                    {isRunningBenchmark ? (
+                                        <div className="text-center space-y-4">
+                                            <div className="relative w-16 h-16 mx-auto">
+                                                <div className="absolute inset-0 border-4 border-blue-500/30 rounded-full"></div>
+                                                <div className="absolute inset-0 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                                            </div>
+                                            <div>
+                                                <h3 className="text-zinc-100 font-semibold">Running Benchmark...</h3>
+                                                <p className="text-zinc-500 text-xs mt-1">{benchmarkProgress}</p>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="w-16 h-16 bg-zinc-800/50 rounded-full flex items-center justify-center border border-zinc-700">
+                                                <Gauge className="w-8 h-8 text-blue-500" />
+                                            </div>
+                                            <div className="text-center space-y-2">
+                                                <h2 className="text-lg font-semibold text-zinc-100">Performance Benchmark</h2>
+                                                <p className="text-xs text-zinc-500 max-w-[240px] mx-auto leading-relaxed">
+                                                    Run an automated sequence of Zoom and Pan operations to stress-test all active layers.
+                                                </p>
+                                            </div>
+                                            <div className="flex flex-col gap-2 w-full max-w-[200px]">
+                                                <button 
+                                                    onClick={runBenchmark}
+                                                    className="bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 px-4 rounded-lg text-sm transition-colors flex items-center justify-center gap-2"
+                                                >
+                                                    <Play className="w-4 h-4 fill-current" /> Run Benchmark
+                                                </button>
+                                            </div>
+                                            <div className="text-[10px] text-zinc-600 border-t border-zinc-800 pt-4 mt-2">
+                                                <p>Steps: Zoom In • Pan East • Pan West • Zoom Out</p>
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
                 </div>
+                
+                {/* METRICS FOOTER */}
+                <div className="border-t border-zinc-800 bg-zinc-950/50 p-3 backdrop-blur-sm">
+                    <div className="flex items-center justify-between mb-2">
+                         <span className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Event Status</span>
+                         <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-medium border ${isMapUpdating || isRunningBenchmark ? 'bg-blue-500/10 border-blue-500/20 text-blue-400' : 'bg-zinc-800 border-zinc-700 text-zinc-400'}`}>
+                             {isMapUpdating || isRunningBenchmark ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                             {isRunningBenchmark ? 'Running Benchmark...' : (isMapUpdating ? 'Processing Requests...' : 'All Layers Complete')}
+                         </div>
+                    </div>
+                    <div className="space-y-1.5 max-h-32 overflow-y-auto">
+                        {metricLayers.map(layer => {
+                            const loading = layerStatuses[layer.id];
+                            return (
+                                <div key={layer.id} className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2 overflow-hidden">
+                                         <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${loading ? 'bg-blue-500 animate-pulse' : 'bg-zinc-600'}`}></div>
+                                         <span className={`text-[11px] truncate max-w-[180px] ${loading ? 'text-blue-200' : 'text-zinc-500'}`} title={layer.title}>{layer.title}</span>
+                                    </div>
+                                    <span className="text-[10px] font-mono text-zinc-600">
+                                        {loading ? 'Running' : 'Done'}
+                                    </span>
+                                </div>
+                            )
+                        })}
+                        {metricLayers.length === 0 && <div className="text-[10px] text-zinc-600 text-center italic">No active service layers</div>}
+                    </div>
+                </div>
+
              </div>
         </div>
 
         <MapComponent 
             layers={layers} 
+            onViewReady={(v) => viewRef.current = v}
             onMapUpdate={setIsMapUpdating} 
             onLayerStatusChange={handleLayerStatusChange}
         />

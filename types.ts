@@ -38,6 +38,19 @@ export interface MapEventHistory {
   layerDurations: Record<string, number>;
 }
 
+export interface BenchmarkStepResult {
+  stepName: string;
+  layerMetrics: Record<string, { loadTime: number; requestCount: number }>;
+}
+
+export interface BenchmarkReportData {
+  date: string;
+  steps: BenchmarkStepResult[];
+  summary: Record<string, { avgLoadTime: number; totalRequests: number; score: number }>;
+  fastestLayerId: string;
+  slowestLayerId: string;
+}
+
 export enum AIStatus {
   IDLE = 'IDLE',
   ANALYZING = 'ANALYZING',
