@@ -1,0 +1,5 @@
+{
+  "name": "GeoPerf AI Monitor",
+  "description": "A high-performance ArcGIS map viewer with real-time network latency monitoring and Gemini AI-powered optimization insights.",
+  "requestFramePermissions": []
+}
