@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import MapView from '@arcgis/core/views/MapView.js';
 import MapComponent from './components/MapComponent';
@@ -7,7 +8,7 @@ import { subscribeToMetrics } from './services/monitor';
 import { analyzePerformance } from './services/ai';
 import { MapLayer, NetworkRequestMetric, LayerPerformanceSummary, AIStatus, MapEventHistory, BenchmarkReportData, BenchmarkStepResult } from './types';
 import { DEFAULT_LAYERS } from './constants';
-import { Layers, Activity, Plus, Trash2, Cpu, Pencil, Check, X, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2, Table as TableIcon, Download, CheckCircle2, Gauge } from 'lucide-react';
+import { Layers, Activity, Plus, Trash2, Cpu, Pencil, Check, X, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2, Table as TableIcon, Download, CheckCircle2, Gauge, Map as MapIcon } from 'lucide-react';
 
 // Simple Markdown Renderer
 const SimpleMarkdown: React.FC<{ content: string }> = ({ content }) => {
@@ -43,11 +44,13 @@ const LAYER_COLORS = [
   '#84cc16', // lime-500
 ];
 
+const BASEMAP_IDS = ['world-imagery', 'vermont-basemap'];
+
 const App: React.FC = () => {
   const [layers, setLayers] = useState<MapLayer[]>([...DEFAULT_LAYERS]);
   const [rawMetrics, setRawMetrics] = useState<NetworkRequestMetric[]>([]);
   const [history, setHistory] = useState<MapEventHistory[]>([]);
-  const [activeTab, setActiveTab] = useState<'layers' | 'ai'>('layers');
+  const [activeTab, setActiveTab] = useState<'layers' | 'basemaps' | 'ai'>('layers');
   const [activeMetricsTab, setActiveMetricsTab] = useState<'current' | 'history' | 'benchmark'>('current');
   
   // Recording State
@@ -56,6 +59,7 @@ const App: React.FC = () => {
   
   // Map Control
   const viewRef = useRef<MapView | null>(null);
+  const mapRef = useRef<any | null>(null); // To access layers for query
 
   // Map Event State
   const [isMapUpdating, setIsMapUpdating] = useState(false);
@@ -233,36 +237,87 @@ const App: React.FC = () => {
       setIsRecording(false); 
       isRecordingRef.current = false; // Use explicit benchmark ref instead
 
-      const startCenter = [-72.5778, 44.5588]; // VT Center
-
-      const steps = [
-          { name: '1. Initialize (Z9)', action: () => viewRef.current?.goTo({ zoom: 9, center: startCenter }) },
-          { name: '2. Zoom In (Z10)', action: () => viewRef.current?.goTo({ zoom: 10 }) },
-          { name: '3. Pan East', action: () => viewRef.current?.goTo({ center: [-72.40, 44.5588] }) },
-          { name: '4. Zoom In (Z11)', action: () => viewRef.current?.goTo({ zoom: 11 }) },
-          { name: '5. Pan South', action: () => viewRef.current?.goTo({ center: [-72.40, 44.45] }) },
-          { name: '6. Zoom In (Z12)', action: () => viewRef.current?.goTo({ zoom: 12 }) },
-          { name: '7. Pan West', action: () => viewRef.current?.goTo({ center: [-72.58, 44.45] }) },
-          { name: '8. Zoom In (Z13)', action: () => viewRef.current?.goTo({ zoom: 13 }) },
-          { name: '9. Pan North', action: () => viewRef.current?.goTo({ center: [-72.58, 44.56] }) },
-          { name: '10. Reset (Z9)', action: () => viewRef.current?.goTo({ zoom: 9, center: startCenter }) },
+      // Defined Towns for meaningful benchmark locations
+      const TOWNS = [
+          { name: 'Montpelier', center: [-72.5778, 44.2601] },
+          { name: 'Burlington', center: [-73.2121, 44.4759] },
+          { name: 'Rutland', center: [-72.9726, 43.6106] },
+          { name: 'St. Albans', center: [-73.0825, 44.8109] },
+          { name: 'Brattleboro', center: [-72.5579, 42.8509] },
+          { name: 'Middlebury', center: [-73.1673, 44.0153] },
+          { name: 'Newport', center: [-72.2053, 44.9362] },
+          { name: 'Bennington', center: [-73.1968, 42.8781] },
+          { name: 'St. Johnsbury', center: [-72.0158, 44.4196] },
+          { name: 'Stowe', center: [-72.6856, 44.4654] },
       ];
 
+      const navSteps = [];
+      // Create 10 navigation steps. 
+      // We cycle zoom levels from 10 to 16 to avoid going too deep (past 16).
+      for (let i = 0; i < 10; i++) {
+          const zoom = 10 + (i % 7); // Results in 10, 11, 12, 13, 14, 15, 16, 10, 11, 12
+          const town = TOWNS[i % TOWNS.length];
+          
+          navSteps.push({
+              name: `Nav ${i+1}: ${town.name} (Z${zoom})`,
+              type: 'nav',
+              action: () => viewRef.current?.goTo({ zoom: zoom, center: town.center })
+          });
+      }
+
+      // Define Query Steps (5 queries)
+      const querySteps = [];
+      for (let i = 1; i <= 5; i++) {
+          querySteps.push({
+              name: `Query ${i}: Features`,
+              type: 'query',
+              action: async () => {
+                  const view = viewRef.current;
+                  if (!view) return;
+                  // Find all active feature layers
+                  const featureLayers = view.map.layers.filter((l: any) => l.type === 'feature' && l.visible);
+                  const queryPromises = featureLayers.map((layer: any) => {
+                      if (layer.queryFeatures) {
+                          // Query current extent, small random offset to avoid cache if possible
+                          const query = layer.createQuery();
+                          query.geometry = view.extent;
+                          query.outFields = ['*'];
+                          query.returnGeometry = false;
+                          return layer.queryFeatures(query).catch((e: any) => console.warn("Query failed", e));
+                      }
+                      return Promise.resolve();
+                  });
+                  await Promise.all(queryPromises);
+              }
+          });
+      }
+
+      const allSteps = [...navSteps, ...querySteps];
       const results: BenchmarkStepResult[] = [];
 
       try {
-          setBenchmarkProgress("Preparing...");
+          setBenchmarkProgress("Initializing...");
+          const startLon = -72.5778;
+          const startLat = 44.5588;
+          await viewRef.current.goTo({ zoom: 9, center: [startLon, startLat] });
           await waitForIdle();
 
-          for (const step of steps) {
+          for (const step of allSteps) {
               setBenchmarkProgress(`Executing: ${step.name}`);
               
               // Clear accumulator
               benchmarkMetricsRef.current = [];
               
-              // Run
+              // Run Action
               await step.action();
-              await waitForIdle();
+              
+              // Wait
+              if (step.type === 'nav') {
+                  await waitForIdle();
+              } else {
+                  // For queries, give network time to resolve since 'updating' might not trigger
+                  await new Promise(r => setTimeout(r, 2000)); 
+              }
               
               // Process Results
               const stepMetrics = calculateMetrics(benchmarkMetricsRef.current);
@@ -275,40 +330,59 @@ const App: React.FC = () => {
                   };
               });
 
+              // @ts-ignore
               results.push({
                   stepName: step.name,
+                  type: step.type as 'nav' | 'query',
                   layerMetrics: resultLayerMetrics
               });
               
-              await new Promise(r => setTimeout(r, 500)); 
+              await new Promise(r => setTimeout(r, 800)); 
           }
 
           // Generate Report
           const summary: BenchmarkReportData['summary'] = {};
+          
           metricLayers.forEach(l => {
-              const layerSteps = results.map(r => r.layerMetrics[l.id]);
-              const totalLoad = layerSteps.reduce((acc, curr) => acc + curr.loadTime, 0);
-              const totalReq = layerSteps.reduce((acc, curr) => acc + curr.requestCount, 0);
+              const layerNavSteps = results.filter(r => r.type === 'nav').map(r => r.layerMetrics[l.id]);
+              const layerQuerySteps = results.filter(r => r.type === 'query').map(r => r.layerMetrics[l.id]);
+              
+              const totalNavLoad = layerNavSteps.reduce((acc, curr) => acc + curr.loadTime, 0);
+              const totalQueryLoad = layerQuerySteps.reduce((acc, curr) => acc + curr.loadTime, 0);
+              const totalReq = [...layerNavSteps, ...layerQuerySteps].reduce((acc, curr) => acc + curr.requestCount, 0);
+              
+              const avgNavLoad = layerNavSteps.length > 0 ? totalNavLoad / layerNavSteps.length : 0;
+              const avgQueryLoad = layerQuerySteps.length > 0 ? totalQueryLoad / layerQuerySteps.length : 0;
+
               summary[l.id] = {
-                  avgLoadTime: totalLoad / results.length,
+                  avgNavLoadTime: avgNavLoad,
+                  avgQueryLoadTime: avgQueryLoad,
                   totalRequests: totalReq,
-                  score: totalLoad 
+                  score: avgNavLoad // Use Navigation Speed as primary ranking score
               };
           });
 
           let fastestId = metricLayers[0]?.id;
           let slowestId = metricLayers[0]?.id;
-          metricLayers.forEach(l => {
-              if (summary[l.id].score < summary[fastestId].score) fastestId = l.id;
-              if (summary[l.id].score > summary[slowestId].score) slowestId = l.id;
-          });
+          
+          if (fastestId) {
+              metricLayers.forEach(l => {
+                  if (summary[l.id].score < summary[fastestId].score) fastestId = l.id;
+                  if (summary[l.id].score > summary[slowestId].score) slowestId = l.id;
+              });
+          }
+          
+          const fastTime = summary[fastestId]?.avgNavLoadTime || 0;
+          const slowTime = summary[slowestId]?.avgNavLoadTime || 0;
+          const percentFaster = fastTime > 0 ? ((slowTime / fastTime) - 1) * 100 : 0;
 
           setBenchmarkReport({
               date: new Date().toLocaleString(),
               steps: results,
               summary,
               fastestLayerId: fastestId,
-              slowestLayerId: slowestId
+              slowestLayerId: slowestId,
+              percentFaster
           });
 
       } catch (e) {
@@ -386,11 +460,11 @@ const App: React.FC = () => {
   return (
     <div className="flex flex-col h-screen w-full bg-zinc-950 text-zinc-100 overflow-hidden font-sans">
       <header className="h-14 border-b border-zinc-800 flex items-center px-4 bg-zinc-900/50 backdrop-blur-md z-10 justify-between">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-4">
             <img 
               src="https://anrmaps.vermont.gov/websites/Images/Logos/MOMlogo.png" 
               alt="Vermont State Logo" 
-              className="w-8 h-8 object-contain"
+              className="h-12 w-auto object-contain"
             />
             <div>
                 <h1 className="font-bold text-sm leading-tight text-zinc-100">VCGI Map Performance Monitor</h1>
@@ -412,21 +486,28 @@ const App: React.FC = () => {
         <div className="absolute left-4 top-4 bottom-4 w-80 z-20 flex flex-col gap-2 pointer-events-none">
             <div className="bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-xl shadow-2xl flex flex-col overflow-hidden pointer-events-auto max-h-full transition-all duration-300">
                 <div className="flex border-b border-zinc-800">
-                    <button onClick={() => setActiveTab('layers')} className={`flex-1 py-3 text-sm font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'layers' ? "text-white border-b-2 border-blue-500" : "text-zinc-500"}`}>
-                        <Layers className="w-4 h-4" /> Layers
+                    <button onClick={() => setActiveTab('layers')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'layers' ? "text-white border-b-2 border-blue-500" : "text-zinc-500"}`}>
+                        <Layers className="w-3 h-3" /> Layers
                     </button>
-                    <button onClick={() => setActiveTab('ai')} className={`flex-1 py-3 text-sm font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'ai' ? "text-white border-b-2 border-purple-500" : "text-zinc-500"}`}>
-                        <Cpu className="w-4 h-4" /> AI
+                    <button onClick={() => setActiveTab('basemaps')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'basemaps' ? "text-white border-b-2 border-green-500" : "text-zinc-500"}`}>
+                        <MapIcon className="w-3 h-3" /> Basemaps
+                    </button>
+                    <button onClick={() => setActiveTab('ai')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'ai' ? "text-white border-b-2 border-purple-500" : "text-zinc-500"}`}>
+                        <Cpu className="w-3 h-3" /> AI
                     </button>
                 </div>
 
                 <div className="flex-1 overflow-y-auto p-4">
-                    {activeTab === 'layers' && (
+                    {(activeTab === 'layers' || activeTab === 'basemaps') && (
                         <div className="space-y-4">
                             <div className="space-y-2">
-                                <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Active Layers</h3>
+                                <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                                    {activeTab === 'layers' ? 'Operational Layers' : 'Basemap Layers'}
+                                </h3>
                                 <ul className="space-y-2">
-                                    {layersWithColors.map(layer => (
+                                    {layersWithColors
+                                        .filter(layer => activeTab === 'basemaps' ? BASEMAP_IDS.includes(layer.id) : !BASEMAP_IDS.includes(layer.id))
+                                        .map(layer => (
                                         <li key={layer.id} className="flex items-center justify-between bg-zinc-950/50 p-2 rounded-lg border border-zinc-800/50 group">
                                             <div className="flex items-center gap-2 overflow-hidden flex-1">
                                                 <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: layer.color }}></div>
@@ -465,25 +546,27 @@ const App: React.FC = () => {
                                 </ul>
                             </div>
 
-                            <div className="space-y-2 pt-4 border-t border-zinc-800">
-                                <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Add Service Layer</h3>
-                                <div className="flex flex-col gap-2">
-                                    <input type="text" value={newLayerUrl} onChange={(e) => setNewLayerUrl(e.target.value)} placeholder="https://.../MapServer" className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm" />
-                                    <div className="relative">
-                                        <input type="text" value={newLayerName} onChange={(e) => setNewLayerName(e.target.value)} placeholder="Layer Name" className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm" />
-                                        {isFetchingName && <div className="absolute right-3 top-1/2 -translate-y-1/2 w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>}
-                                    </div>
-                                    <div className="flex gap-2">
-                                        <select value={newLayerType} onChange={(e) => setNewLayerType(e.target.value as any)} className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm w-2/3 text-zinc-300">
-                                            <option value="feature">Feature Layer</option>
-                                            <option value="map-image">Map Image</option>
-                                            <option value="tile">Tile Layer</option>
-                                            <option value="vector-tile">Vector Tile</option>
-                                        </select>
-                                        <button onClick={handleAddLayer} disabled={!newLayerUrl} className="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg flex justify-center"><Plus className="w-4 h-4" /></button>
+                            {activeTab === 'layers' && (
+                                <div className="space-y-2 pt-4 border-t border-zinc-800">
+                                    <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Add Service Layer</h3>
+                                    <div className="flex flex-col gap-2">
+                                        <input type="text" value={newLayerUrl} onChange={(e) => setNewLayerUrl(e.target.value)} placeholder="https://.../MapServer" className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm" />
+                                        <div className="relative">
+                                            <input type="text" value={newLayerName} onChange={(e) => setNewLayerName(e.target.value)} placeholder="Layer Name" className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm" />
+                                            {isFetchingName && <div className="absolute right-3 top-1/2 -translate-y-1/2 w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>}
+                                        </div>
+                                        <div className="flex gap-2">
+                                            <select value={newLayerType} onChange={(e) => setNewLayerType(e.target.value as any)} className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm w-2/3 text-zinc-300">
+                                                <option value="feature">Feature Layer</option>
+                                                <option value="map-image">Map Image</option>
+                                                <option value="tile">Tile Layer</option>
+                                                <option value="vector-tile">Vector Tile</option>
+                                            </select>
+                                            <button onClick={handleAddLayer} disabled={!newLayerUrl} className="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg flex justify-center"><Plus className="w-4 h-4" /></button>
+                                        </div>
                                     </div>
                                 </div>
-                            </div>
+                            )}
                         </div>
                     )}
                     {activeTab === 'ai' && (
@@ -649,7 +732,7 @@ const App: React.FC = () => {
                                             <div className="text-center space-y-2">
                                                 <h2 className="text-lg font-semibold text-zinc-100">Performance Benchmark</h2>
                                                 <p className="text-xs text-zinc-500 max-w-[240px] mx-auto leading-relaxed">
-                                                    Run an automated sequence of Zoom and Pan operations to stress-test all active layers.
+                                                    Run an automated sequence of Zoom (10-16), Pan, and Feature Query operations to stress-test active layers.
                                                 </p>
                                             </div>
                                             <div className="flex flex-col gap-2 w-full max-w-[200px]">
@@ -661,7 +744,7 @@ const App: React.FC = () => {
                                                 </button>
                                             </div>
                                             <div className="text-[10px] text-zinc-600 border-t border-zinc-800 pt-4 mt-2">
-                                                <p>Steps: Zoom In • Pan East • Pan West • Zoom Out</p>
+                                                <p>Steps: 10 Nav (Z10-16) • 5 Queries</p>
                                             </div>
                                         </>
                                     )}

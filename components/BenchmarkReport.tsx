@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { BenchmarkReportData, MapLayer } from '../types';
 import { Download, Trophy, AlertTriangle, FileBarChart } from 'lucide-react';
@@ -12,34 +13,75 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
   const layerMap = new Map(layers.map(l => [l.id, l]));
   const metricLayers = layers.filter(l => !l.excludeFromMetrics);
 
+  const fastest = layerMap.get(report.fastestLayerId);
+  const slowest = layerMap.get(report.slowestLayerId);
+  
+  const fastTime = report.summary[report.fastestLayerId]?.avgNavLoadTime || 0;
+  const slowTime = report.summary[report.slowestLayerId]?.avgNavLoadTime || 0;
+
   const downloadReport = () => {
-    // Create detailed CSV
-    const headers = ['Step', ...metricLayers.map(l => `${l.title} (s)`)];
+    // 1. Create Performance Summary Section
+    const perfSummary = [
+        'PERFORMANCE SUMMARY',
+        `Fastest Layer,${fastest?.title || 'N/A'}`,
+        `Slowest Layer,${slowest?.title || 'N/A'}`,
+        `Avg Nav Speed (Fastest),${fastTime.toFixed(3)}s`,
+        `Avg Nav Speed (Slowest),${slowTime.toFixed(3)}s`,
+        `Performance Gain,${report.percentFaster.toFixed(1)}% faster`,
+        ''
+    ];
+
+    // 2. Create Steps Data
+    const headers = ['Step', 'Type', ...metricLayers.map(l => `${l.title} (s)`), 'Fastest Layer', '% Faster vs Slowest'];
     const rows = report.steps.map(step => {
+        // Identify fastest and slowest for this specific step
+        const times = metricLayers.map(l => ({
+            title: l.title,
+            time: step.layerMetrics[l.id]?.loadTime || 0
+        }));
+        
+        // Sort to find min/max. Filter out 0s if strict, but here 0 usually implies cache or error, still a valid metric
+        const sorted = [...times].sort((a, b) => a.time - b.time);
+        const fastestInStep = sorted[0];
+        const slowestInStep = sorted[sorted.length - 1];
+
+        const percentSpread = fastestInStep.time > 0 
+            ? ((slowestInStep.time / fastestInStep.time) - 1) * 100 
+            : 0;
+
         return [
             step.stepName,
-            ...metricLayers.map(l => (step.layerMetrics[l.id]?.loadTime || 0).toFixed(3))
+            step.type === 'nav' ? 'Navigation' : 'Query',
+            ...metricLayers.map(l => (step.layerMetrics[l.id]?.loadTime || 0).toFixed(3)),
+            fastestInStep.title,
+            `${percentSpread.toFixed(1)}%`
         ].join(',');
     });
 
-    // Add Summary Section to CSV
-    const summaryHeader = ['Layer', 'Avg Load Time (s)', 'Total Requests'];
+    // 3. Create Stats Summary Section (Split Nav vs Query)
+    const summaryHeader = ['Layer', 'Avg Nav Load (s)', 'Avg Query Load (s)', 'Total Requests'];
     const summaryRows = metricLayers.map(l => {
         const s = report.summary[l.id];
-        return [l.title, s?.avgLoadTime.toFixed(3) || '0', s?.totalRequests || '0'].join(',');
+        return [
+            `"${l.title}"`, 
+            s?.avgNavLoadTime.toFixed(3) || '0', 
+            s?.avgQueryLoadTime.toFixed(3) || '0', 
+            s?.totalRequests || '0'
+        ].join(',');
     });
 
     const csvContent = [
         'BENCHMARK RESULTS',
         `Date,${report.date}`,
         '',
-        'STEP DETAILS',
-        headers.join(','),
-        ...rows,
-        '',
-        'SUMMARY',
+        ...perfSummary,
+        'LAYER STATISTICS',
         summaryHeader.join(','),
-        ...summaryRows
+        ...summaryRows,
+        '',
+        'DETAILED LOG',
+        headers.join(','),
+        ...rows
     ].join('\n');
 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -51,9 +93,6 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
     link.click();
     document.body.removeChild(link);
   };
-
-  const fastest = layerMap.get(report.fastestLayerId);
-  const slowest = layerMap.get(report.slowestLayerId);
 
   return (
     <div className="flex flex-col h-full bg-zinc-900/50 rounded-lg border border-zinc-800 overflow-hidden">
@@ -76,7 +115,10 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
                 </div>
                 <div className="text-sm font-medium text-zinc-100 truncate" title={fastest?.title}>{fastest?.title || 'N/A'}</div>
                 <div className="text-xs text-zinc-400 mt-1">
-                    Avg: <span className="text-green-400 font-mono font-bold">{report.summary[report.fastestLayerId]?.avgLoadTime.toFixed(3)}s</span>
+                    Avg Nav: <span className="text-green-400 font-mono font-bold">{fastTime.toFixed(3)}s</span>
+                </div>
+                <div className="text-[10px] text-zinc-500 mt-1">
+                   <span className="text-green-400 font-bold">{report.percentFaster.toFixed(0)}%</span> faster than slowest
                 </div>
             </div>
             <div className="bg-gradient-to-br from-red-900/20 to-zinc-900 border border-red-500/30 p-3 rounded-lg">
@@ -85,7 +127,7 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
                 </div>
                 <div className="text-sm font-medium text-zinc-100 truncate" title={slowest?.title}>{slowest?.title || 'N/A'}</div>
                 <div className="text-xs text-zinc-400 mt-1">
-                    Avg: <span className="text-red-400 font-mono font-bold">{report.summary[report.slowestLayerId]?.avgLoadTime.toFixed(3)}s</span>
+                    Avg Nav: <span className="text-red-400 font-mono font-bold">{slowTime.toFixed(3)}s</span>
                 </div>
             </div>
         </div>
@@ -106,22 +148,33 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
                     <tbody className="divide-y divide-zinc-800">
                         {report.steps.map((step, idx) => (
                             <tr key={idx} className="hover:bg-zinc-800/30">
-                                <td className="p-2 font-medium text-zinc-300">{step.stepName}</td>
+                                <td className="p-2 font-medium text-zinc-300 flex items-center gap-2">
+                                    <span className={`w-1.5 h-1.5 rounded-full ${step.type === 'nav' ? 'bg-blue-500' : 'bg-purple-500'}`}></span>
+                                    {step.stepName}
+                                </td>
                                 {metricLayers.map(l => {
                                     const val = step.layerMetrics[l.id]?.loadTime;
-                                    // Highlight outliers
                                     const isSlow = val > 2;
                                     const color = isSlow ? 'text-red-400' : 'text-zinc-400';
                                     return <td key={l.id} className={`p-2 font-mono ${color}`}>{val ? val.toFixed(3) : '-'}</td>
                                 })}
                             </tr>
                         ))}
-                        {/* Averages Row */}
+                        {/* Averages Row - Nav */}
                         <tr className="bg-zinc-900/50 font-bold border-t-2 border-zinc-800">
-                            <td className="p-2 text-zinc-200">Average</td>
+                            <td className="p-2 text-zinc-200">Avg Navigation</td>
                             {metricLayers.map(l => (
                                 <td key={l.id} className="p-2 text-blue-400 font-mono">
-                                    {report.summary[l.id]?.avgLoadTime.toFixed(3)}
+                                    {report.summary[l.id]?.avgNavLoadTime.toFixed(3)}
+                                </td>
+                            ))}
+                        </tr>
+                        {/* Averages Row - Query */}
+                        <tr className="bg-zinc-900/50 font-bold border-t border-zinc-800/50">
+                            <td className="p-2 text-zinc-200">Avg Query</td>
+                            {metricLayers.map(l => (
+                                <td key={l.id} className="p-2 text-purple-400 font-mono">
+                                    {report.summary[l.id]?.avgQueryLoadTime.toFixed(3)}
                                 </td>
                             ))}
                         </tr>
