@@ -1,6 +1,7 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import MapView from '@arcgis/core/views/MapView.js';
+import Legend from '@arcgis/core/widgets/Legend.js';
 import MapComponent from './components/MapComponent';
 import { MetricCharts } from './components/MetricCharts';
 import { BenchmarkReport } from './components/BenchmarkReport';
@@ -8,7 +9,7 @@ import { subscribeToMetrics } from './services/monitor';
 import { analyzePerformance } from './services/ai';
 import { MapLayer, NetworkRequestMetric, LayerPerformanceSummary, AIStatus, MapEventHistory, BenchmarkReportData, BenchmarkStepResult } from './types';
 import { DEFAULT_LAYERS } from './constants';
-import { Layers, Activity, Plus, Trash2, Cpu, Pencil, Check, X, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2, Table as TableIcon, Download, CheckCircle2, Gauge, Map as MapIcon } from 'lucide-react';
+import { Layers, Activity, Plus, Trash2, Cpu, Pencil, Check, X, ArrowRightLeft, Play, Pause, RotateCcw, Trophy, Timer, Loader2, Table as TableIcon, Download, CheckCircle2, Gauge, Map as MapIcon, List } from 'lucide-react';
 
 // Simple Markdown Renderer
 const SimpleMarkdown: React.FC<{ content: string }> = ({ content }) => {
@@ -44,13 +45,13 @@ const LAYER_COLORS = [
   '#84cc16', // lime-500
 ];
 
-const BASEMAP_IDS = ['world-imagery', 'vermont-basemap'];
+const BASEMAP_IDS = ['vermont-basemap'];
 
 const App: React.FC = () => {
   const [layers, setLayers] = useState<MapLayer[]>([...DEFAULT_LAYERS]);
   const [rawMetrics, setRawMetrics] = useState<NetworkRequestMetric[]>([]);
   const [history, setHistory] = useState<MapEventHistory[]>([]);
-  const [activeTab, setActiveTab] = useState<'layers' | 'basemaps' | 'ai'>('layers');
+  const [activeTab, setActiveTab] = useState<'layers' | 'basemaps' | 'ai' | 'legend'>('layers');
   const [activeMetricsTab, setActiveMetricsTab] = useState<'current' | 'history' | 'benchmark'>('current');
   
   // Recording State
@@ -60,6 +61,7 @@ const App: React.FC = () => {
   // Map Control
   const viewRef = useRef<MapView | null>(null);
   const mapRef = useRef<any | null>(null); // To access layers for query
+  const legendDiv = useRef<HTMLDivElement>(null);
 
   // Map Event State
   const [isMapUpdating, setIsMapUpdating] = useState(false);
@@ -147,6 +149,30 @@ const App: React.FC = () => {
     }, 800);
     return () => clearTimeout(timer);
   }, [newLayerUrl]);
+
+  // Init Legend Widget when tab is active
+  useEffect(() => {
+    if (activeTab === 'legend' && viewRef.current && legendDiv.current) {
+        const view = viewRef.current;
+        
+        // Filter for operational layers only (exclude basemaps)
+        const layerInfos = view.map.layers
+            .filter(layer => !BASEMAP_IDS.includes(layer.id))
+            .map(layer => ({ layer: layer, title: layer.title }))
+            .toArray();
+
+        const legend = new Legend({
+            view: view,
+            container: legendDiv.current,
+            layerInfos: layerInfos,
+            style: 'card' 
+        });
+
+        return () => {
+            legend.destroy();
+        };
+    }
+  }, [activeTab, layers]);
 
   // Aggregation Logic (Reusable)
   const calculateMetrics = (metrics: NetworkRequestMetric[]) => {
@@ -492,12 +518,15 @@ const App: React.FC = () => {
                     <button onClick={() => setActiveTab('basemaps')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'basemaps' ? "text-white border-b-2 border-green-500" : "text-zinc-500"}`}>
                         <MapIcon className="w-3 h-3" /> Basemaps
                     </button>
+                    <button onClick={() => setActiveTab('legend')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'legend' ? "text-white border-b-2 border-amber-500" : "text-zinc-500"}`}>
+                        <List className="w-3 h-3" /> Legend
+                    </button>
                     <button onClick={() => setActiveTab('ai')} className={`flex-1 py-3 text-xs font-medium flex justify-center items-center gap-2 transition-colors ${activeTab === 'ai' ? "text-white border-b-2 border-purple-500" : "text-zinc-500"}`}>
                         <Cpu className="w-3 h-3" /> AI
                     </button>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-4">
+                <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
                     {(activeTab === 'layers' || activeTab === 'basemaps') && (
                         <div className="space-y-4">
                             <div className="space-y-2">
@@ -567,6 +596,17 @@ const App: React.FC = () => {
                                     </div>
                                 </div>
                             )}
+                        </div>
+                    )}
+                    {activeTab === 'legend' && (
+                        <div className="h-full flex flex-col">
+                             <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-4">Map Legend</div>
+                             <div className="flex-1 bg-zinc-950/50 rounded-lg border border-zinc-800 p-2 overflow-y-auto min-h-[200px]">
+                                 <div ref={legendDiv} className="w-full"></div>
+                             </div>
+                             <div className="text-[10px] text-zinc-600 mt-2 text-center">
+                                 Showing operational layers only
+                             </div>
                         </div>
                     )}
                     {activeTab === 'ai' && (

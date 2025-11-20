@@ -18,7 +18,8 @@ export const PerformanceHistoryChart: React.FC<PerformanceHistoryChartProps> = (
     let maxDuration = 0;
     history.forEach(h => {
       Object.values(h.layerDurations).forEach(d => {
-        if (d > maxDuration) maxDuration = d;
+        // FIX: Cast `d` to number as its type is inferred as `unknown`.
+        if ((d as number) > maxDuration) maxDuration = d as number;
       });
     });
     // Minimum scale of 1s

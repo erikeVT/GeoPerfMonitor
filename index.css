@@ -1,0 +1,22 @@
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  overflow: hidden;
+  background-color: #18181b; /* zinc-950 */
+}
+/* Custom Scrollbar for Dashboard */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #27272a; 
+}
+::-webkit-scrollbar-thumb {
+  background: #52525b; 
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #71717a; 
+}

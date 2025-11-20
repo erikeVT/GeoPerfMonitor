@@ -59,14 +59,29 @@ export const initInterceptor = () => {
       const startTime = requestOptions.customStartTime || (endTime - 50); // Fallback
       const duration = endTime - startTime;
 
+      let size = 0;
+      try {
+          if (response.data) {
+             if (requestOptions.responseType === 'json') {
+                 size = JSON.stringify(response.data).length;
+             } else if (response.data.byteLength) {
+                 size = response.data.byteLength; // ArrayBuffer
+             } else if (response.data.size) {
+                 size = response.data.size; // Blob
+             }
+          }
+      } catch (e) {
+          // Ignore serialization errors to prevent interceptor crash
+      }
+
       const metric: NetworkRequestMetric = {
         id: generateId(),
         url: response.url,
         startTime,
         endTime,
         duration,
-        status: requestOptions.responseType === 'json' ? 200 : 200, // Simplified status
-        size: response.data ? JSON.stringify(response.data).length : 0,
+        status: 200, // Simplified status
+        size,
       };
 
       notifyListeners(metric);

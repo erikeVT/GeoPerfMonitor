@@ -2,6 +2,7 @@
 import React, { useEffect, useRef } from 'react';
 import ArcGISMap from '@arcgis/core/Map.js';
 import MapView from '@arcgis/core/views/MapView.js';
+import Extent from '@arcgis/core/geometry/Extent.js';
 import FeatureLayer from '@arcgis/core/layers/FeatureLayer.js';
 import TileLayer from '@arcgis/core/layers/TileLayer.js';
 import MapImageLayer from '@arcgis/core/layers/MapImageLayer.js';
@@ -34,14 +35,18 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
 
     if (mapDiv.current) {
       const map = new ArcGISMap({
-        basemap: "dark-gray-vector"
+        basemap: "satellite"
       });
 
       const view = new MapView({
         container: mapDiv.current,
         map: map,
-        center: [-72.5778, 44.5588], // Vermont Center
-        zoom: 8,
+        extent: new Extent({
+            xmin: -73.4377,
+            ymin: 42.7268,
+            xmax: -71.5102,
+            ymax: 45.0156
+        }),
         ui: {
             components: ["zoom", "compass", "attribution"] 
         }

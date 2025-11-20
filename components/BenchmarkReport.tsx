@@ -10,7 +10,8 @@ interface BenchmarkReportProps {
 }
 
 export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers, onClose }) => {
-  const layerMap = new Map(layers.map(l => [l.id, l]));
+  // FIX: Explicitly type `layerMap` to aid type inference.
+  const layerMap: Map<string, MapLayer> = new Map(layers.map(l => [l.id, l]));
   const metricLayers = layers.filter(l => !l.excludeFromMetrics);
 
   const fastest = layerMap.get(report.fastestLayerId);
@@ -18,21 +19,27 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
   
   const fastTime = report.summary[report.fastestLayerId]?.avgNavLoadTime || 0;
   const slowTime = report.summary[report.slowestLayerId]?.avgNavLoadTime || 0;
+  const timesFaster = fastTime > 0 ? slowTime / fastTime : 1;
+
 
   const downloadReport = () => {
+    const timesFasterForCsv = fastTime > 0 ? slowTime / fastTime : 1;
     // 1. Create Performance Summary Section
-    const perfSummary = [
+    const perfSummaryHeaders = ['Category', 'Layer Name', 'Avg Nav Speed (s)', 'Performance Factor'];
+    const perfSummaryRows = [
+        ['Fastest', `"${fastest?.title || 'N/A'}"`, fastTime.toFixed(3), `${timesFasterForCsv.toFixed(2)}x`],
+        ['Slowest', `"${slowest?.title || 'N/A'}"`, slowTime.toFixed(3), '1.00x (Baseline)']
+    ];
+    const perfSummaryContent = [
         'PERFORMANCE SUMMARY',
-        `Fastest Layer,${fastest?.title || 'N/A'}`,
-        `Slowest Layer,${slowest?.title || 'N/A'}`,
-        `Avg Nav Speed (Fastest),${fastTime.toFixed(3)}s`,
-        `Avg Nav Speed (Slowest),${slowTime.toFixed(3)}s`,
-        `Performance Gain,${report.percentFaster.toFixed(1)}% faster`,
+        perfSummaryHeaders.join(','),
+        ...perfSummaryRows.map(row => row.join(',')),
         ''
     ];
 
+
     // 2. Create Steps Data
-    const headers = ['Step', 'Type', ...metricLayers.map(l => `${l.title} (s)`), 'Fastest Layer', '% Faster vs Slowest'];
+    const headers = ['Step', 'Type', ...metricLayers.map(l => `${l.title} (s)`), 'Fastest Layer', 'Times Faster (vs Slowest)'];
     const rows = report.steps.map(step => {
         // Identify fastest and slowest for this specific step
         const times = metricLayers.map(l => ({
@@ -45,16 +52,16 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
         const fastestInStep = sorted[0];
         const slowestInStep = sorted[sorted.length - 1];
 
-        const percentSpread = fastestInStep.time > 0 
-            ? ((slowestInStep.time / fastestInStep.time) - 1) * 100 
-            : 0;
+        const timesFasterSpread = fastestInStep.time > 0 
+            ? slowestInStep.time / fastestInStep.time
+            : 1;
 
         return [
             step.stepName,
             step.type === 'nav' ? 'Navigation' : 'Query',
             ...metricLayers.map(l => (step.layerMetrics[l.id]?.loadTime || 0).toFixed(3)),
             fastestInStep.title,
-            `${percentSpread.toFixed(1)}%`
+            `${timesFasterSpread.toFixed(2)}x`
         ].join(',');
     });
 
@@ -74,7 +81,7 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
         'BENCHMARK RESULTS',
         `Date,${report.date}`,
         '',
-        ...perfSummary,
+        ...perfSummaryContent,
         'LAYER STATISTICS',
         summaryHeader.join(','),
         ...summaryRows,
@@ -118,7 +125,7 @@ export const BenchmarkReport: React.FC<BenchmarkReportProps> = ({ report, layers
                     Avg Nav: <span className="text-green-400 font-mono font-bold">{fastTime.toFixed(3)}s</span>
                 </div>
                 <div className="text-[10px] text-zinc-500 mt-1">
-                   <span className="text-green-400 font-bold">{report.percentFaster.toFixed(0)}%</span> faster than slowest
+                   <span className="text-green-400 font-bold">{timesFaster.toFixed(1)}x</span> faster than slowest
                 </div>
             </div>
             <div className="bg-gradient-to-br from-red-900/20 to-zinc-900 border border-red-500/30 p-3 rounded-lg">
