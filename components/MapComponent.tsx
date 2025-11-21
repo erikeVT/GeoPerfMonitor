@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { MapLayer } from '../types';
 import { initInterceptor } from '../services/monitor';
 
@@ -19,6 +19,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
   const mapDiv = useRef<HTMLDivElement>(null);
   const viewRef = useRef<any | null>(null);
   const mapRef = useRef<any | null>(null);
+   const [arcgisReady, setArcgisReady] = useState(false);
   
   // Track handles to clean up watchers if needed
   const layerWatchers = useRef<Map<string, IHandle>> (new Map());
@@ -31,38 +32,17 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
 
     const loadArcGIS = async () => {
       if (!mapDiv.current) return;
-
-      // Try to set worker URL before loading modules so importScripts uses correct path.
-      // Prefer local assets at /arcgis-assets if available, otherwise fall back to the CDN.
+      // Initialize ArcGIS config and (if possible) patch fetch to route CDN/absolute asset
+      // requests to local `arcgis-assets` before loading ArcGIS modules.
       try {
-        const cfg = await import('@arcgis/core/config.js');
-        try {
-          const localWorkerPath = '/arcgis-assets/esri/core/workers/RemoteClient.js';
-          let useLocal = false;
-          try {
-            const resp = await fetch(localWorkerPath, { method: 'HEAD' });
-            if (resp.ok) useLocal = true;
-          } catch (e) {
-            useLocal = false;
-          }
-
-          if (useLocal) {
-            cfg.default.assetsPath = '/arcgis-assets';
-            cfg.default.workersUrl = '/arcgis-assets/esri/core/workers/';
-            console.log('Using local ArcGIS assets at /arcgis-assets');
-          } else {
-            cfg.default.workersUrl = 'https://js.arcgis.com/4.28/esri/core/workers/';
-          }
-        } catch (e) {
-          console.warn('Failed setting ArcGIS workersUrl', e);
-        }
+        const { initArcGIS } = await import('../services/arcgis');
+        await initArcGIS();
       } catch (e) {
-        // Not fatal - continue to attempt loading modules
-        console.warn('Could not import ArcGIS config module', e);
+        console.warn('ArcGIS init helper failed', e);
       }
 
         try {
-        const [{ default: ArcGISMap }, { default: MapView }, { default: Extent }, { default: FeatureLayer }, { default: TileLayer }, { default: MapImageLayer }, { default: VectorTileLayer }, { default: reactiveUtils }] = await Promise.all([
+        const [{ default: ArcGISMap }, { default: MapView }, { default: Extent }, { default: FeatureLayer }, { default: TileLayer }, { default: MapImageLayer }, { default: VectorTileLayer }, reactiveUtilsModule] = await Promise.all([
           import('@arcgis/core/Map.js'),
           import('@arcgis/core/views/MapView.js'),
           import('@arcgis/core/geometry/Extent.js'),
@@ -86,10 +66,13 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
 
         viewRef.current = view;
         mapRef.current = map;
+        // Signal that ArcGIS map/view are initialized so layer-sync effect can run
+        setArcgisReady(true);
 
+        const reactiveUtils = reactiveUtilsModule as any;
         // Watch for the 'updating' property to track global map events using reactiveUtils (watch is deprecated)
         try {
-          handle = reactiveUtils.watch(() => view.updating, (val: any) => {
+          handle = reactiveUtils?.watch(() => view.updating, (val: any) => {
             if (onMapUpdate) onMapUpdate(val);
           });
         } catch (e) {
@@ -97,7 +80,48 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
           try { handle = view.watch('updating', (val: any) => { if (onMapUpdate) onMapUpdate(val); }); } catch (err) { console.warn('Failed to attach view watcher', err); }
         }
 
-        view.when(() => { if (onViewReady) onViewReady(view); });
+        view.when(() => {
+          console.debug('[MapComponent] view is ready');
+          // expose view for debugging in the browser console
+          try { (window as any).__geoPerfView = view; } catch (e) {}
+          if (onViewReady) onViewReady(view);
+          // Force a tiny, non-visual pan (offset + restore) to trigger a robust initial render
+          (async () => {
+            try {
+              const c: any = view.center;
+              const lon = (c && (c.longitude ?? c.x)) || 0;
+              const lat = (c && (c.latitude ?? c.y)) || 0;
+              const offset = 0.00001;
+              // offset then restore without animation
+              // @ts-ignore
+              await view.goTo({ center: [lon + offset, lat] }, { animate: false });
+              // @ts-ignore
+              await view.goTo({ center: [lon, lat] }, { animate: false });
+            } catch (e) {
+              try {
+                // Fallback: single no-op goTo
+                // @ts-ignore
+                view.goTo({ center: view.center, zoom: view.zoom }, { animate: false }).catch(() => {});
+              } catch (err) { /* ignore */ }
+            }
+          })();
+          // helper to force a layer load/refresh from the console
+          try {
+            (window as any).__forceLayerLoad = async (layerId: string) => {
+              const v = (window as any).__geoPerfView;
+              if (!v) return console.warn('view not available');
+              const layer = v.map.findLayerById(layerId);
+              if (!layer) return console.warn('layer not found', layerId);
+              try {
+                console.debug('forcing load for', layerId);
+                if (layer.load) await layer.load();
+                await v.whenLayerView(layer);
+                await v.goTo({ center: v.center }, { animate: false });
+                console.debug('force load complete for', layerId);
+              } catch (e) { console.warn('force load failed', e); }
+            };
+          } catch (e) {}
+        });
 
       } catch (error) {
         console.error('Failed to load ArcGIS modules', error);
@@ -130,13 +154,14 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
     const ensureAndSync = async () => {
       // Dynamically import layer classes so bundler doesn't fail if ArcGIS modules are unavailable at startup
       try {
-        const [{ default: FeatureLayer }, { default: TileLayer }, { default: MapImageLayer }, { default: VectorTileLayer }, { default: reactiveUtils }] = await Promise.all([
+        const [{ default: FeatureLayer }, { default: TileLayer }, { default: MapImageLayer }, { default: VectorTileLayer }, reactiveUtilsModule] = await Promise.all([
           import('@arcgis/core/layers/FeatureLayer.js'),
           import('@arcgis/core/layers/TileLayer.js'),
           import('@arcgis/core/layers/MapImageLayer.js'),
           import('@arcgis/core/layers/VectorTileLayer.js'),
           import('@arcgis/core/core/reactiveUtils.js'),
         ]);
+        const reactiveUtils = reactiveUtilsModule as any;
 
         if (cancelled) return;
 
@@ -151,52 +176,78 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
                  url = url.replace(/\/\d+$/, '');
               }
 
-              if (layerConfig.type === 'feature') {
-                layer = new FeatureLayer({ id: layerConfig.id, url: layerConfig.url, title: layerConfig.title, outFields: ['*'], popupTemplate: { title: '{title}', content: 'OBJECTID: {OBJECTID}' } });
-              } else if (layerConfig.type === 'tile') {
-                layer = new TileLayer({ id: layerConfig.id, url, title: layerConfig.title });
-              } else if (layerConfig.type === 'map-image') {
-                layer = new MapImageLayer({ id: layerConfig.id, url, title: layerConfig.title });
-              } else if (layerConfig.type === 'vector-tile') {
-                layer = new VectorTileLayer({ id: layerConfig.id, url, title: layerConfig.title });
+                  if (layerConfig.type === 'feature') {
+                    layer = new FeatureLayer({ id: layerConfig.id, url: layerConfig.url, title: layerConfig.title, visible: layerConfig.visible, outFields: ['*'], popupTemplate: { title: '{title}', content: 'OBJECTID: {OBJECTID}' } });
+                  } else if (layerConfig.type === 'tile') {
+                    layer = new TileLayer({ id: layerConfig.id, url, title: layerConfig.title, visible: layerConfig.visible });
+                  } else if (layerConfig.type === 'map-image') {
+                    layer = new MapImageLayer({ id: layerConfig.id, url, title: layerConfig.title, visible: layerConfig.visible });
+                  } else if (layerConfig.type === 'vector-tile') {
+                    layer = new VectorTileLayer({ id: layerConfig.id, url, title: layerConfig.title, visible: layerConfig.visible });
               }
 
               if (layer) {
                 map.add(layer);
 
-                // Order logic: Base layers at bottom
-                if (layerConfig.id === 'world-imagery') {
-                  map.reorder(layer, 0);
-                } else if (layerConfig.id === 'vermont-basemap') {
-                  map.reorder(layer, 1);
-                }
-
-                // Watch for individual layer updating status
-                view.whenLayerView(layer).then((layerView: any) => {
-                  if (layerWatchers.current.has(layerConfig.id)) {
-                    layerWatchers.current.get(layerConfig.id)?.remove();
-                  }
-
-                  const watchHandle = ((): any => {
-                    try {
-                      return reactiveUtils.watch(() => layerView.updating, (val: any) => {
-                        if (onLayerStatusChange) onLayerStatusChange(layerConfig.id, val);
-                      });
-                    } catch (e) {
-                      // fallback to deprecated API
-                      try { return layerView.watch('updating', (val: any) => { if (onLayerStatusChange) onLayerStatusChange(layerConfig.id, val); }); } catch (err) { console.warn('Failed to attach layerView watcher', err); return null; }
+                // Ensure the layer is loaded before attaching LayerView watchers.
+                (async () => {
+                  console.debug('[MapComponent] added layer', layerConfig.id, layerConfig.type, layerConfig.url);
+                  try {
+                    if (layer.load) {
+                      console.debug(`[MapComponent] starting layer.load() for ${layerConfig.id}`);
+                      await layer.load();
+                      console.debug(`[MapComponent] layer.load() resolved for ${layerConfig.id}`);
                     }
-                  })();
-
-                  // @ts-ignore
-                  layerWatchers.current.set(layerConfig.id, watchHandle);
-                }).catch((e: any) => console.warn('LayerView failed', e));
-
-                layer.when(() => {
-                  if (!layerConfig.excludeFromMetrics) {
-                    view.goTo(layer.fullExtent).catch((e: any) => console.warn('Zoom failed', e));
+                  } catch (e) {
+                    console.warn('layer.load failed', e);
                   }
-                });
+
+                  // Order logic: Base layers at bottom
+                  try {
+                    if (layerConfig.id === 'world-imagery') {
+                      map.reorder(layer, 0);
+                    } else if (layerConfig.id === 'vermont-basemap') {
+                      map.reorder(layer, 1);
+                    }
+                  } catch (e) { /* ignore reorder errors */ }
+
+                  // Watch for individual layer updating status
+                  try {
+                    console.debug(`[MapComponent] waiting for layerView for ${layerConfig.id}`);
+                    const layerView = await view.whenLayerView(layer);
+                    console.debug(`[MapComponent] layerView ready for ${layerConfig.id}`);
+                    if (layerWatchers.current.has(layerConfig.id)) {
+                      layerWatchers.current.get(layerConfig.id)?.remove();
+                    }
+
+                    const watchHandle = ((): any => {
+                      try {
+                        return reactiveUtils.watch(() => layerView.updating, (val: any) => {
+                          console.debug(`[MapComponent] layerView.updating ${layerConfig.id}:`, val);
+                          if (onLayerStatusChange) onLayerStatusChange(layerConfig.id, val);
+                        });
+                      } catch (e) {
+                        try { return layerView.watch('updating', (val: any) => { if (onLayerStatusChange) onLayerStatusChange(layerConfig.id, val); }); } catch (err) { console.warn('Failed to attach layerView watcher', err); return null; }
+                      }
+                    })();
+
+                    // @ts-ignore
+                    layerWatchers.current.set(layerConfig.id, watchHandle);
+                  } catch (e) {
+                    console.warn('LayerView failed', e);
+                  }
+
+                  try {
+                    console.debug(`[MapComponent] waiting layer.when() for ${layerConfig.id}`);
+                    await layer.when();
+                    console.debug(`[MapComponent] layer.when() resolved for ${layerConfig.id}`);
+                    if (!layerConfig.excludeFromMetrics) {
+                      view.goTo(layer.fullExtent).catch((e: any) => console.warn('Zoom failed', e));
+                    }
+                  } catch (e) {
+                    console.warn('layer.when failed', e);
+                  }
+                })();
               }
             } catch (error) {
               console.error('Failed to create layer', layerConfig, error);
@@ -229,7 +280,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ layers, onViewReady, onMapU
 
     return () => { cancelled = true; };
 
-  }, [layers, onLayerStatusChange]);
+  }, [layers, onLayerStatusChange, arcgisReady]);
 
   return <div className="w-full h-full outline-none" ref={mapDiv} />;
 };

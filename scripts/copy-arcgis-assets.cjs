@@ -39,6 +39,19 @@ async function main() {
   try {
     await copyDir(src, dest);
     console.log('ArcGIS assets copied successfully.');
+
+    // Basic verification: ensure some critical files exist
+    const checkFiles = [
+      path.join(dest, 'esri', 'core', 'workers', 'RemoteClient.js'),
+      path.join(dest, 'components', 'assets', 'icon', 'plus16.json')
+    ];
+    for (const f of checkFiles) {
+      try {
+        await fs.promises.access(f);
+      } catch (err) {
+        console.warn(`Warning: expected ArcGIS asset not found: ${f}`);
+      }
+    }
   } catch (err) {
     console.error('Failed to copy ArcGIS assets:', err);
   }

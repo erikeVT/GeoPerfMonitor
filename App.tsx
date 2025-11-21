@@ -48,6 +48,7 @@ const LAYER_COLORS = [
 const BASEMAP_IDS = ['vermont-basemap'];
 
 const App: React.FC = () => {
+    // ArcGIS fallback detection removed: no banner in header
   const [layers, setLayers] = useState<MapLayer[]>([...DEFAULT_LAYERS]);
   const [rawMetrics, setRawMetrics] = useState<NetworkRequestMetric[]>([]);
   const [history, setHistory] = useState<MapEventHistory[]>([]);
@@ -506,6 +507,8 @@ const App: React.FC = () => {
             </div>
         </div>
       </header>
+
+            {/* ArcGIS fallback banner removed */}
 
       <div className="flex flex-1 overflow-hidden relative">
         {/* LEFT Sidebar */}
